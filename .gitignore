@@ -1,0 +1,50 @@
+## BINARIES ##
+bin/*
+*.exe
+*.dll
+*.so
+*.dylib
+
+
+## STDERR STDOUT ##
+*.out
+*.err
+
+
+## DIRECTORY SPECIFIC ##
+go.work
+.mcoder-workspace
+
+
+## DIRECTORIES ##
+*/
+
+
+## FILES ##
+
+
+## IDE ##
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+
+## OS ##
+.DS_Store
+Thumbs.db
+__pycache__
+
+## LOGS ##
+*.log
+*.gz
+
+
+## TEMPORARY ##
+tmp/*
+temp/*
+
+
+## GIT-CRYPT ##
+git-crypt-key-*
