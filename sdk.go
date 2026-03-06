@@ -6,8 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"regexp"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -71,17 +69,27 @@ const (
 // ClientMessage is the single NATS message type for all SSE lifecycle events
 // and browser-initiated actions under the new per-page endpoint model.
 //
-// NATS subject (no version):  {website}.{uid}.{pathSegments}.{conn_uuid}.message
-// NATS subject (versioned):   {website}.{uid}.v{N}.{pathSegments}.{conn_uuid}.message
+// NATS subject (uid present): {website}.{uid}.{pathSegments}.{conn_uuid}.message
+// NATS subject (uid absent):  {website}.{pathSegments}.{conn_uuid}.message
 //
-// Version is 0 when no /v{N} prefix was present on the original request path.
+// The full path — including any version prefix — is used directly as path
+// segments. No version stripping or injection is performed. A path of
+// /v0/sse/index produces segments v0.sse.index. A path of /sse/dashboard
+// produces segments sse.dashboard.
+//
+// Example for /v0/sse/index, uid absent:
+//
+//	battlefrontier.v0.sse.index.{conn_uuid}.message
+//
+// Example for /v1/sse/dashboard, uid present:
+//
+//	battlefrontier.user123.v1.sse.dashboard.{conn_uuid}.message
 type ClientMessage struct {
 	ConnUUID    string              `json:"conn_uuid"`
 	MessageID   string              `json:"message_id"`
 	Type        ClientMessageType   `json:"type"`
 	Website     string              `json:"website"`
 	UID         string              `json:"uid"`
-	Version     int                 `json:"version,omitempty"`
 	Path        string              `json:"path"`
 	Method      string              `json:"method,omitempty"`
 	Headers     map[string][]string `json:"headers,omitempty"`
@@ -129,30 +137,6 @@ type DisconnectHandler func(note *DisconnectNotification)
 // The context passed to the connected handler invocation is cancelled when a
 // disconnected message arrives for the same conn_uuid.
 type SSEHandler func(ctx context.Context, msg *ClientMessage, conn *Conn)
-
-// ─── Version parsing ──────────────────────────────────────────────────────────
-
-// versionPrefixRe matches a leading /v{N} segment.
-var versionPrefixRe = regexp.MustCompile(`^/v(\d+)(/.*)?$`)
-
-// parseVersionFromPath extracts the version integer and the remainder of the
-// path when the path begins with /v{N}. Returns version=0 and the original
-// path when no version prefix is present.
-func parseVersionFromPath(path string) (version int, rest string) {
-	m := versionPrefixRe.FindStringSubmatch(path)
-	if m == nil {
-		return 0, path
-	}
-	v, err := strconv.Atoi(m[1])
-	if err != nil {
-		return 0, path
-	}
-	remaining := m[2]
-	if remaining == "" {
-		remaining = "/"
-	}
-	return v, remaining
-}
 
 // ─── SDK Client ───────────────────────────────────────────────────────────────
 
@@ -229,15 +213,18 @@ func New(cfg Config) (*Client, error) {
 // Handle subscribes to all requests arriving on the given HTTP path for
 // standard (non-SSE) endpoints.
 //
-// When path contains a version prefix (e.g. /v0/api/logout) the subscription
-// subjects include the version segment so they match the relay's versioned
-// NATS subjects.
+// The full path — including any version prefix — is used directly as path
+// segments in the NATS subject wildcards. No version extraction or injection
+// is performed. The path /v0/api/logout produces segments v0.api.logout.
 //
 // Two NATS subscriptions are created per path:
-//   - {website}.*.v{N}.{pathSegments}.request.*   — authenticated (uid present, versioned)
-//   - {website}.v{N}.{pathSegments}.request.*     — unauthenticated (uid absent, versioned)
+//   - {website}.*.{pathSegments}.request.*  — authenticated (uid present)
+//   - {website}.{pathSegments}.request.*    — unauthenticated (uid absent)
 //
-// When no version prefix is present the v{N} segment is omitted.
+// Example for /v0/api/logout:
+//
+//	battlefrontier.*.v0.api.logout.request.*
+//	battlefrontier.v0.api.logout.request.*
 func (c *Client) Handle(path string, h Handler, onDisconnect DisconnectHandler) error {
 	authedSubject := c.requestSubjectWithUID(path)
 	anonSubject := c.requestSubjectNoUID(path)
@@ -341,18 +328,23 @@ func (c *Client) Handle(path string, h Handler, onDisconnect DisconnectHandler) 
 // HandleSSE subscribes to all ClientMessage events for the given SSE path via
 // JetStream.
 //
-// When path contains a version prefix (e.g. /v0/sse/index) the subscription
-// subjects include the version segment so they match the relay's versioned
-// NATS subjects. The relay injects the version segment immediately after the
-// website+uid prefix, so the subscription wildcard must mirror that layout.
+// The full path — including any version prefix — is used directly as path
+// segments in the NATS subject wildcards. No version extraction or injection
+// is performed. The path /v0/sse/index produces segments v0.sse.index.
 //
 // Two NATS wildcard subscriptions are created per path:
-//   - {website}.*.v{N}.{pathSegments}.*.message  — authenticated (uid present, versioned)
-//   - {website}.v{N}.{pathSegments}.*.message    — unauthenticated (uid absent, versioned)
+//   - {website}.*.{pathSegments}.*.message  — authenticated (uid present)
+//   - {website}.{pathSegments}.*.message    — unauthenticated (uid absent)
 //
-// When no version prefix is present the v{N} segment is omitted:
-//   - {website}.*.{pathSegments}.*.message
-//   - {website}.{pathSegments}.*.message
+// Example for /v0/sse/index:
+//
+//	battlefrontier.*.v0.sse.index.*.message   (authenticated)
+//	battlefrontier.v0.sse.index.*.message     (unauthenticated)
+//
+// Example for /sse/dashboard (no version):
+//
+//	battlefrontier.*.sse.dashboard.*.message  (authenticated)
+//	battlefrontier.sse.dashboard.*.message    (unauthenticated)
 func (c *Client) HandleSSE(path string, h SSEHandler) error {
 	authedSubject := c.clientMessageSubjectWithUID(path)
 	anonSubject := c.clientMessageSubjectNoUID(path)
@@ -456,77 +448,63 @@ func (c *Client) Close() {
 // ─── Subject builders (client-level) ─────────────────────────────────────────
 
 // requestSubjectWithUID returns the NATS wildcard subject for authenticated
-// standard requests. When the path includes a version prefix the version
-// segment is injected after the uid wildcard.
+// standard requests.
 //
-// No version:  {website}.*.{pathSegments}.request.*
-// Versioned:   {website}.*.v{N}.{pathSegments}.request.*
+// The full path is used directly — no version extraction. A path of
+// /v0/api/login produces v0.api.login as the path segments.
+//
+// Format: {website}.*.{pathSegments}.request.*
 func (c *Client) requestSubjectWithUID(path string) string {
-	version, rest := parseVersionFromPath(path)
-	segments := pathSegments(rest)
-	parts := make([]string, 0, 4+len(segments))
+	segs := pathSegments(path)
+	parts := make([]string, 0, 4+len(segs))
 	parts = append(parts, c.websiteName, "*")
-	if version > 0 {
-		parts = append(parts, fmt.Sprintf("v%d", version))
-	}
-	parts = append(parts, segments...)
+	parts = append(parts, segs...)
 	parts = append(parts, "request", "*")
 	return strings.Join(parts, ".")
 }
 
 // requestSubjectNoUID returns the NATS wildcard subject for unauthenticated
-// standard requests. When the path includes a version prefix the version
-// segment is injected after the website name.
+// standard requests.
 //
-// No version:  {website}.{pathSegments}.request.*
-// Versioned:   {website}.v{N}.{pathSegments}.request.*
+// The full path is used directly — no version extraction.
+//
+// Format: {website}.{pathSegments}.request.*
 func (c *Client) requestSubjectNoUID(path string) string {
-	version, rest := parseVersionFromPath(path)
-	segments := pathSegments(rest)
-	parts := make([]string, 0, 3+len(segments))
+	segs := pathSegments(path)
+	parts := make([]string, 0, 3+len(segs))
 	parts = append(parts, c.websiteName)
-	if version > 0 {
-		parts = append(parts, fmt.Sprintf("v%d", version))
-	}
-	parts = append(parts, segments...)
+	parts = append(parts, segs...)
 	parts = append(parts, "request", "*")
 	return strings.Join(parts, ".")
 }
 
 // clientMessageSubjectWithUID returns the NATS wildcard subject for
-// authenticated SSE page connections (uid present). When the path includes a
-// version prefix the version segment is injected after the uid wildcard.
+// authenticated SSE page connections (uid present).
 //
-// No version:  {website}.*.{pathSegments}.*.message
-// Versioned:   {website}.*.v{N}.{pathSegments}.*.message
+// The full path is used directly — no version extraction. A path of
+// /v0/sse/index produces v0.sse.index as the path segments.
+//
+// Format: {website}.*.{pathSegments}.*.message
 func (c *Client) clientMessageSubjectWithUID(path string) string {
-	version, rest := parseVersionFromPath(path)
-	segments := pathSegments(rest)
-	parts := make([]string, 0, 5+len(segments))
+	segs := pathSegments(path)
+	parts := make([]string, 0, 4+len(segs))
 	parts = append(parts, c.websiteName, "*")
-	if version > 0 {
-		parts = append(parts, fmt.Sprintf("v%d", version))
-	}
-	parts = append(parts, segments...)
+	parts = append(parts, segs...)
 	parts = append(parts, "*", "message")
 	return strings.Join(parts, ".")
 }
 
 // clientMessageSubjectNoUID returns the NATS wildcard subject for
-// unauthenticated SSE page connections (uid absent). When the path includes a
-// version prefix the version segment is injected after the website name.
+// unauthenticated SSE page connections (uid absent).
 //
-// No version:  {website}.{pathSegments}.*.message
-// Versioned:   {website}.v{N}.{pathSegments}.*.message
+// The full path is used directly — no version extraction.
+//
+// Format: {website}.{pathSegments}.*.message
 func (c *Client) clientMessageSubjectNoUID(path string) string {
-	version, rest := parseVersionFromPath(path)
-	segments := pathSegments(rest)
-	parts := make([]string, 0, 4+len(segments))
+	segs := pathSegments(path)
+	parts := make([]string, 0, 3+len(segs))
 	parts = append(parts, c.websiteName)
-	if version > 0 {
-		parts = append(parts, fmt.Sprintf("v%d", version))
-	}
-	parts = append(parts, segments...)
+	parts = append(parts, segs...)
 	parts = append(parts, "*", "message")
 	return strings.Join(parts, ".")
 }
@@ -687,20 +665,42 @@ func (c *Conn) jsPublish(subject string, v any) error {
 
 // ─── Subject builders ─────────────────────────────────────────────────────────
 
+// responseSubject builds the NATS subject the relay listens on for the backend
+// reply to a standard request.
+//
+// The full path is used directly as path segments. No version extraction.
+//
+// Format (uid present): {website}.{uid}.{pathSegments}.response.{uuid}
+// Format (uid absent):  {website}.{pathSegments}.response.{uuid}
 func responseSubject(website, uid, path, uuid string) string {
 	segs := baseSegments(website, uid, path)
 	segs = append(segs, "response", uuid)
 	return strings.Join(segs, ".")
 }
 
+// sseEventSubject builds the NATS subject the relay subscribes to in order to
+// receive Datastar events the backend wants pushed to the client.
+//
+// The SSE event subject does NOT include the path or version. It is keyed only
+// by website, uid, and conn_uuid. The conn_uuid is globally unique (UUID v4)
+// so no path disambiguation is needed.
+//
+// Format (uid present): {website}.{uid}.sse.{conn_uuid}.event
+// Format (uid absent):  {website}.sse.{conn_uuid}.event
 func sseEventSubject(website, uid, connUUID string) string {
 	return strings.Join(sseSegments(website, uid, connUUID, "event"), ".")
 }
 
+// sseDisconnectedSubject builds the legacy disconnect notification subject.
+//
+// Format (uid present): {website}.{uid}.sse.{conn_uuid}.disconnected
+// Format (uid absent):  {website}.sse.{conn_uuid}.disconnected
 func sseDisconnectedSubject(website, uid, connUUID string) string {
 	return strings.Join(sseSegments(website, uid, connUUID, "disconnected"), ".")
 }
 
+// sseSegments builds the segment slice for SSE event/connected/disconnected
+// subjects, omitting uid when empty.
 func sseSegments(website, uid, connUUID, suffix string) []string {
 	if uid == "" {
 		return []string{website, "sse", connUUID, suffix}
@@ -708,6 +708,13 @@ func sseSegments(website, uid, connUUID, suffix string) []string {
 	return []string{website, uid, "sse", connUUID, suffix}
 }
 
+// baseSegments builds the common website+uid+path portion shared by subject
+// builders. When uid is empty it is omitted. The full path — including any
+// version prefix — is split on "/" and each non-empty segment is included.
+// Dots in path segments are replaced with underscores so they do not break
+// NATS subject parsing.
+//
+// This mirrors the relay's internal/relay/subject.go baseSegments exactly.
 func baseSegments(website, uid, path string) []string {
 	segs := pathSegments(path)
 	var out []string
@@ -721,6 +728,16 @@ func baseSegments(website, uid, path string) []string {
 	return append(out, segs...)
 }
 
+// pathSegments splits a URL path on "/" and returns the non-empty segments
+// with dots replaced by underscores. The full path is used as-is — no version
+// extraction or stripping is performed.
+//
+// Examples:
+//
+//	/v0/sse/index     → ["v0", "sse", "index"]
+//	/sse/dashboard    → ["sse", "dashboard"]
+//	/v1/api/login     → ["v1", "api", "login"]
+//	/api/v1.2/ep      → ["api", "v1_2", "ep"]
 func pathSegments(path string) []string {
 	parts := strings.Split(path, "/")
 	out := make([]string, 0, len(parts))

@@ -8,8 +8,14 @@ import (
 // TestClientMessageSubjectWithUID verifies the wildcard subject used by
 // HandleSSE for authenticated connections.
 //
-// Unversioned format: {website}.*.{pathSegments}.*.message
-// Versioned format:   {website}.*.v{N}.{pathSegments}.*.message
+// The full path is used directly as path segments. No version extraction.
+//
+// Format: {website}.*.{pathSegments}.*.message
+//
+// Examples:
+//
+//	/sse/dashboard  → battlefrontier.*.sse.dashboard.*.message
+//	/v0/sse/index   → battlefrontier.*.v0.sse.index.*.message
 func TestClientMessageSubjectWithUID(t *testing.T) {
 	c := &Client{websiteName: "battlefrontier"}
 
@@ -37,7 +43,7 @@ func TestClientMessageSubjectWithUID(t *testing.T) {
 			path: "/sse/v1.2/page",
 			want: "battlefrontier.*.sse.v1_2.page.*.message",
 		},
-		// Versioned paths — version segment injected after uid wildcard.
+		// Versioned paths — version segment is part of the path, not injected separately.
 		{
 			path: "/v0/sse/index",
 			want: "battlefrontier.*.v0.sse.index.*.message",
@@ -63,8 +69,14 @@ func TestClientMessageSubjectWithUID(t *testing.T) {
 // TestClientMessageSubjectNoUID verifies the wildcard subject used by
 // HandleSSE for unauthenticated connections.
 //
-// Unversioned format: {website}.{pathSegments}.*.message
-// Versioned format:   {website}.v{N}.{pathSegments}.*.message
+// The full path is used directly as path segments. No version extraction.
+//
+// Format: {website}.{pathSegments}.*.message
+//
+// Examples:
+//
+//	/sse/dashboard  → battlefrontier.sse.dashboard.*.message
+//	/v0/sse/index   → battlefrontier.v0.sse.index.*.message
 func TestClientMessageSubjectNoUID(t *testing.T) {
 	c := &Client{websiteName: "battlefrontier"}
 
@@ -92,7 +104,7 @@ func TestClientMessageSubjectNoUID(t *testing.T) {
 			path: "/sse/v1.2/page",
 			want: "battlefrontier.sse.v1_2.page.*.message",
 		},
-		// Versioned paths — version segment injected after website name.
+		// Versioned paths — version segment is part of the path, not injected separately.
 		{
 			path: "/v0/sse/index",
 			want: "battlefrontier.v0.sse.index.*.message",
@@ -150,10 +162,11 @@ func TestClientMessageSubject_NoExtraSSEToken_NoUID(t *testing.T) {
 }
 
 // TestRequestSubjectWithUID verifies the wildcard subject for authenticated
-// standard requests including versioned paths.
+// standard requests.
 //
-// Unversioned: {website}.*.{pathSegments}.request.*
-// Versioned:   {website}.*.v{N}.{pathSegments}.request.*
+// The full path is used directly. No version extraction.
+//
+// Format: {website}.*.{pathSegments}.request.*
 func TestRequestSubjectWithUID(t *testing.T) {
 	c := &Client{websiteName: "battlefrontier"}
 
@@ -173,7 +186,7 @@ func TestRequestSubjectWithUID(t *testing.T) {
 			path: "/api/v1.2/endpoint",
 			want: "battlefrontier.*.api.v1_2.endpoint.request.*",
 		},
-		// Versioned paths.
+		// Versioned paths — version is part of the segments, not injected.
 		{
 			path: "/v0/api/login",
 			want: "battlefrontier.*.v0.api.login.request.*",
@@ -193,10 +206,11 @@ func TestRequestSubjectWithUID(t *testing.T) {
 }
 
 // TestRequestSubjectNoUID verifies the wildcard subject for unauthenticated
-// standard requests including versioned paths.
+// standard requests.
 //
-// Unversioned: {website}.{pathSegments}.request.*
-// Versioned:   {website}.v{N}.{pathSegments}.request.*
+// The full path is used directly. No version extraction.
+//
+// Format: {website}.{pathSegments}.request.*
 func TestRequestSubjectNoUID(t *testing.T) {
 	c := &Client{websiteName: "battlefrontier"}
 
@@ -212,7 +226,7 @@ func TestRequestSubjectNoUID(t *testing.T) {
 			path: "/api/v2/profile/update",
 			want: "battlefrontier.api.v2.profile.update.request.*",
 		},
-		// Versioned paths.
+		// Versioned paths — version is part of the segments, not injected.
 		{
 			path: "/v0/api/login",
 			want: "battlefrontier.v0.api.login.request.*",
@@ -260,6 +274,14 @@ func TestResponseSubject(t *testing.T) {
 			path:    "/api/v2/profile/update",
 			uuid:    "req-2",
 			want:    "mysite.u1.api.v2.profile.update.response.req-2",
+		},
+		// Versioned path — version stays in segments.
+		{
+			website: "battlefrontier",
+			uid:     "user123",
+			path:    "/v0/api/logout",
+			uuid:    "req-3",
+			want:    "battlefrontier.user123.v0.api.logout.response.req-3",
 		},
 	}
 
@@ -349,6 +371,10 @@ func TestPathSegments(t *testing.T) {
 		{"api/login", []string{"api", "login"}},
 		{"/", []string{}},
 		{"", []string{}},
+		// Versioned paths — version segment is included as-is.
+		{"/v0/sse/index", []string{"v0", "sse", "index"}},
+		{"/v1/api/login", []string{"v1", "api", "login"}},
+		{"/v10/sse/dashboard", []string{"v10", "sse", "dashboard"}},
 	}
 
 	for _, tc := range cases {
@@ -362,31 +388,6 @@ func TestPathSegments(t *testing.T) {
 			if got[i] != tc.want[i] {
 				t.Errorf("pathSegments(%q)[%d]: got %q, want %q", tc.path, i, got[i], tc.want[i])
 			}
-		}
-	}
-}
-
-// TestParseVersionFromPath verifies version prefix extraction.
-func TestParseVersionFromPath(t *testing.T) {
-	cases := []struct {
-		path        string
-		wantVersion int
-		wantRest    string
-	}{
-		{"/v0/sse/index", 0, "/sse/index"},
-		{"/v1/api/login", 1, "/api/login"},
-		{"/v10/sse/dashboard", 10, "/sse/dashboard"},
-		{"/sse/dashboard", 0, "/sse/dashboard"},
-		{"/api/login", 0, "/api/login"},
-		{"/v0/", 0, "/"},
-		{"/v1", 1, "/"},
-	}
-
-	for _, tc := range cases {
-		gotV, gotR := parseVersionFromPath(tc.path)
-		if gotV != tc.wantVersion || gotR != tc.wantRest {
-			t.Errorf("parseVersionFromPath(%q)\n  got  version=%d rest=%q\n  want version=%d rest=%q",
-				tc.path, gotV, gotR, tc.wantVersion, tc.wantRest)
 		}
 	}
 }
@@ -416,6 +417,19 @@ func TestBaseSegments(t *testing.T) {
 			uid:     "u1",
 			path:    "/api/v2/profile",
 			want:    []string{"mysite", "u1", "api", "v2", "profile"},
+		},
+		// Versioned paths — version segment stays in position.
+		{
+			website: "battlefrontier",
+			uid:     "user123",
+			path:    "/v0/sse/index",
+			want:    []string{"battlefrontier", "user123", "v0", "sse", "index"},
+		},
+		{
+			website: "battlefrontier",
+			uid:     "",
+			path:    "/v0/sse/index",
+			want:    []string{"battlefrontier", "v0", "sse", "index"},
 		},
 	}
 
@@ -489,5 +503,39 @@ func TestClientMessageType_Constants(t *testing.T) {
 	}
 	if ClientMessageDisconnected != "disconnected" {
 		t.Errorf("ClientMessageDisconnected: got %q, want %q", ClientMessageDisconnected, "disconnected")
+	}
+}
+
+// TestVersionedVsUnversionedSubjects confirms that versioned and unversioned
+// paths produce distinct subjects and that the version segment appears in the
+// correct position.
+func TestVersionedVsUnversionedSubjects(t *testing.T) {
+	c := &Client{websiteName: "battlefrontier"}
+
+	// /v0/sse/login and /sse/login must produce different subjects.
+	v0WithUID := c.clientMessageSubjectWithUID("/v0/sse/login")
+	noVerWithUID := c.clientMessageSubjectWithUID("/sse/login")
+
+	if v0WithUID == noVerWithUID {
+		t.Errorf("versioned and unversioned paths produced identical subjects: %q", v0WithUID)
+	}
+	if v0WithUID != "battlefrontier.*.v0.sse.login.*.message" {
+		t.Errorf("v0 withUID: got %q, want %q", v0WithUID, "battlefrontier.*.v0.sse.login.*.message")
+	}
+	if noVerWithUID != "battlefrontier.*.sse.login.*.message" {
+		t.Errorf("noVer withUID: got %q, want %q", noVerWithUID, "battlefrontier.*.sse.login.*.message")
+	}
+
+	v0NoUID := c.clientMessageSubjectNoUID("/v0/sse/login")
+	noVerNoUID := c.clientMessageSubjectNoUID("/sse/login")
+
+	if v0NoUID == noVerNoUID {
+		t.Errorf("versioned and unversioned paths produced identical subjects (no uid): %q", v0NoUID)
+	}
+	if v0NoUID != "battlefrontier.v0.sse.login.*.message" {
+		t.Errorf("v0 noUID: got %q, want %q", v0NoUID, "battlefrontier.v0.sse.login.*.message")
+	}
+	if noVerNoUID != "battlefrontier.sse.login.*.message" {
+		t.Errorf("noVer noUID: got %q, want %q", noVerNoUID, "battlefrontier.sse.login.*.message")
 	}
 }
