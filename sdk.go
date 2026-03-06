@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -69,18 +71,17 @@ const (
 // ClientMessage is the single NATS message type for all SSE lifecycle events
 // and browser-initiated actions under the new per-page endpoint model.
 //
-// NATS subject: {website}.{uid}.{pathSegments}.{conn_uuid}.message
+// NATS subject (no version):  {website}.{uid}.{pathSegments}.{conn_uuid}.message
+// NATS subject (versioned):   {website}.{uid}.v{N}.{pathSegments}.{conn_uuid}.message
 //
-// Type distinguishes lifecycle events from browser actions. Action (populated
-// only for ClientMessageAction) is a free-form string defined by the
-// application (e.g. "login", "attack", "buy_item"). Payload carries
-// arbitrary JSON from the browser POST body.
+// Version is 0 when no /v{N} prefix was present on the original request path.
 type ClientMessage struct {
 	ConnUUID    string              `json:"conn_uuid"`
 	MessageID   string              `json:"message_id"`
 	Type        ClientMessageType   `json:"type"`
 	Website     string              `json:"website"`
 	UID         string              `json:"uid"`
+	Version     int                 `json:"version,omitempty"`
 	Path        string              `json:"path"`
 	Method      string              `json:"method,omitempty"`
 	Headers     map[string][]string `json:"headers,omitempty"`
@@ -129,6 +130,30 @@ type DisconnectHandler func(note *DisconnectNotification)
 // disconnected message arrives for the same conn_uuid.
 type SSEHandler func(ctx context.Context, msg *ClientMessage, conn *Conn)
 
+// ─── Version parsing ──────────────────────────────────────────────────────────
+
+// versionPrefixRe matches a leading /v{N} segment.
+var versionPrefixRe = regexp.MustCompile(`^/v(\d+)(/.*)?$`)
+
+// parseVersionFromPath extracts the version integer and the remainder of the
+// path when the path begins with /v{N}. Returns version=0 and the original
+// path when no version prefix is present.
+func parseVersionFromPath(path string) (version int, rest string) {
+	m := versionPrefixRe.FindStringSubmatch(path)
+	if m == nil {
+		return 0, path
+	}
+	v, err := strconv.Atoi(m[1])
+	if err != nil {
+		return 0, path
+	}
+	remaining := m[2]
+	if remaining == "" {
+		remaining = "/"
+	}
+	return v, remaining
+}
+
 // ─── SDK Client ───────────────────────────────────────────────────────────────
 
 // Client is the SDK entry point. Create one per backend process.
@@ -150,10 +175,7 @@ type Config struct {
 }
 
 // New connects to NATS, initialises a JetStream context, and returns a ready
-// Client. The JetStream context is used to subscribe to ClientMessage subjects
-// (which the relay publishes via JetStream) and to publish SSE events (which
-// the relay subscribes to via JetStream). Core NATS is kept for response
-// subjects (ephemeral, not covered by a stream).
+// Client.
 func New(cfg Config) (*Client, error) {
 	if len(cfg.NatsURLs) == 0 {
 		return nil, fmt.Errorf("relaysdk: at least one NATS URL required")
@@ -207,24 +229,20 @@ func New(cfg Config) (*Client, error) {
 // Handle subscribes to all requests arriving on the given HTTP path for
 // standard (non-SSE) endpoints.
 //
-// Standard request subjects are published by the relay via JetStream, so this
-// method subscribes via JetStream push consumer with DeliverAll (required by
-// WorkQueue stream retention policy). Response subjects are ephemeral (not in
-// the stream) and are published via core NATS by Conn.
+// When path contains a version prefix (e.g. /v0/api/logout) the subscription
+// subjects include the version segment so they match the relay's versioned
+// NATS subjects.
 //
 // Two NATS subscriptions are created per path:
-//   - {website}.*.{pathSegments}.request.*   — authenticated requests (uid present)
-//   - {website}.{pathSegments}.request.*     — unauthenticated requests (uid absent)
+//   - {website}.*.v{N}.{pathSegments}.request.*   — authenticated (uid present, versioned)
+//   - {website}.v{N}.{pathSegments}.request.*     — unauthenticated (uid absent, versioned)
 //
-// onDisconnect receives disconnect notifications for SSE connections on this
-// path. Pass nil if not needed or for standard endpoints.
+// When no version prefix is present the v{N} segment is omitted.
 func (c *Client) Handle(path string, h Handler, onDisconnect DisconnectHandler) error {
 	authedSubject := c.requestSubjectWithUID(path)
 	anonSubject := c.requestSubjectNoUID(path)
 
 	handler := func(msg *nats.Msg) {
-		// Acknowledge the JetStream message immediately so the server does not
-		// redeliver it. The relay uses AckExplicit on its push consumers.
 		if err := msg.Ack(); err != nil {
 			log.Printf("relaysdk: Handle ack error on %q: %v", msg.Subject, err)
 		}
@@ -295,9 +313,6 @@ func (c *Client) Handle(path string, h Handler, onDisconnect DisconnectHandler) 
 		}()
 	}
 
-	// WorkQueue stream retention policy requires DeliverAll on push consumers.
-	// DeliverNew is rejected by the server with "consumer must be deliver all
-	// on workqueue stream".
 	sub1, err := c.js.Subscribe(authedSubject, handler,
 		nats.DeliverAll(),
 		nats.AckExplicit(),
@@ -324,30 +339,30 @@ func (c *Client) Handle(path string, h Handler, onDisconnect DisconnectHandler) 
 }
 
 // HandleSSE subscribes to all ClientMessage events for the given SSE path via
-// JetStream. The relay publishes ClientMessage to JetStream-covered subjects,
-// so a JetStream push consumer subscription is required to receive them.
+// JetStream.
 //
-// The handler is called for connected, action, and disconnected messages.
+// When path contains a version prefix (e.g. /v0/sse/index) the subscription
+// subjects include the version segment so they match the relay's versioned
+// NATS subjects. The relay injects the version segment immediately after the
+// website+uid prefix, so the subscription wildcard must mirror that layout.
 //
 // Two NATS wildcard subscriptions are created per path:
-//   - {website}.*.{pathSegments}.*.message  — authenticated connections (uid present)
-//   - {website}.{pathSegments}.*.message    — unauthenticated connections (uid absent)
+//   - {website}.*.v{N}.{pathSegments}.*.message  — authenticated (uid present, versioned)
+//   - {website}.v{N}.{pathSegments}.*.message    — unauthenticated (uid absent, versioned)
 //
-// The context passed to the connected handler invocation is cancelled when a
-// disconnected message arrives for the same conn_uuid.
+// When no version prefix is present the v{N} segment is omitted:
+//   - {website}.*.{pathSegments}.*.message
+//   - {website}.{pathSegments}.*.message
 func (c *Client) HandleSSE(path string, h SSEHandler) error {
 	authedSubject := c.clientMessageSubjectWithUID(path)
 	anonSubject := c.clientMessageSubjectNoUID(path)
 
-	// cancelMap tracks active conn_uuid → cancel functions so that a
-	// disconnected message can cancel the context for the matching connection.
 	var (
 		cancelMu  sync.Mutex
 		cancelMap = make(map[string]context.CancelFunc)
 	)
 
 	handler := func(msg *nats.Msg) {
-		// Acknowledge the JetStream message so the server does not redeliver it.
 		if err := msg.Ack(); err != nil {
 			log.Printf("relaysdk: HandleSSE ack error on %q: %v", msg.Subject, err)
 		}
@@ -362,14 +377,11 @@ func (c *Client) HandleSSE(path string, h SSEHandler) error {
 			nc:          c.nc,
 			js:          c.js,
 			websiteName: c.websiteName,
-			// req is nil for the new SSE model; conn_uuid and uid come from ClientMessage.
-			clientMsg: &cm,
+			clientMsg:   &cm,
 		}
 
 		switch cm.Type {
 		case ClientMessageConnected:
-			// Create a cancellable context for this connection. Store the
-			// cancel so a future disconnected message can cancel it.
 			ctx, cancel := context.WithCancel(context.Background())
 			cancelMu.Lock()
 			cancelMap[cm.ConnUUID] = cancel
@@ -377,8 +389,6 @@ func (c *Client) HandleSSE(path string, h SSEHandler) error {
 
 			go func() {
 				defer func() {
-					// Ensure cancel is called and entry removed even if the
-					// handler returns before a disconnected message arrives.
 					cancelMu.Lock()
 					if fn, ok := cancelMap[cm.ConnUUID]; ok {
 						fn()
@@ -390,11 +400,9 @@ func (c *Client) HandleSSE(path string, h SSEHandler) error {
 			}()
 
 		case ClientMessageAction:
-			// Action handlers run with a background context.
 			go h(context.Background(), &cm, conn)
 
 		case ClientMessageDisconnected:
-			// Cancel the context for the connected handler of this connection.
 			cancelMu.Lock()
 			if cancel, ok := cancelMap[cm.ConnUUID]; ok {
 				cancel()
@@ -402,8 +410,6 @@ func (c *Client) HandleSSE(path string, h SSEHandler) error {
 			}
 			cancelMu.Unlock()
 
-			// Still call the handler so the application can react to the
-			// disconnect event (e.g. cleanup, logging).
 			go h(context.Background(), &cm, conn)
 
 		default:
@@ -411,7 +417,6 @@ func (c *Client) HandleSSE(path string, h SSEHandler) error {
 		}
 	}
 
-	// WorkQueue stream retention policy requires DeliverAll on push consumers.
 	sub1, err := c.js.Subscribe(authedSubject, handler,
 		nats.DeliverAll(),
 		nats.AckExplicit(),
@@ -451,52 +456,76 @@ func (c *Client) Close() {
 // ─── Subject builders (client-level) ─────────────────────────────────────────
 
 // requestSubjectWithUID returns the NATS wildcard subject for authenticated
-// standard requests.
+// standard requests. When the path includes a version prefix the version
+// segment is injected after the uid wildcard.
 //
-// Format: {website}.*.{pathSegments}.request.*
+// No version:  {website}.*.{pathSegments}.request.*
+// Versioned:   {website}.*.v{N}.{pathSegments}.request.*
 func (c *Client) requestSubjectWithUID(path string) string {
-	segments := pathSegments(path)
-	parts := make([]string, 0, 3+len(segments))
+	version, rest := parseVersionFromPath(path)
+	segments := pathSegments(rest)
+	parts := make([]string, 0, 4+len(segments))
 	parts = append(parts, c.websiteName, "*")
+	if version > 0 {
+		parts = append(parts, fmt.Sprintf("v%d", version))
+	}
 	parts = append(parts, segments...)
 	parts = append(parts, "request", "*")
 	return strings.Join(parts, ".")
 }
 
 // requestSubjectNoUID returns the NATS wildcard subject for unauthenticated
-// standard requests.
+// standard requests. When the path includes a version prefix the version
+// segment is injected after the website name.
 //
-// Format: {website}.{pathSegments}.request.*
+// No version:  {website}.{pathSegments}.request.*
+// Versioned:   {website}.v{N}.{pathSegments}.request.*
 func (c *Client) requestSubjectNoUID(path string) string {
-	segments := pathSegments(path)
-	parts := make([]string, 0, 2+len(segments))
+	version, rest := parseVersionFromPath(path)
+	segments := pathSegments(rest)
+	parts := make([]string, 0, 3+len(segments))
 	parts = append(parts, c.websiteName)
+	if version > 0 {
+		parts = append(parts, fmt.Sprintf("v%d", version))
+	}
 	parts = append(parts, segments...)
 	parts = append(parts, "request", "*")
 	return strings.Join(parts, ".")
 }
 
 // clientMessageSubjectWithUID returns the NATS wildcard subject for
-// authenticated SSE page connections (uid present).
+// authenticated SSE page connections (uid present). When the path includes a
+// version prefix the version segment is injected after the uid wildcard.
 //
-// Format: {website}.*.{pathSegments}.*.message
+// No version:  {website}.*.{pathSegments}.*.message
+// Versioned:   {website}.*.v{N}.{pathSegments}.*.message
 func (c *Client) clientMessageSubjectWithUID(path string) string {
-	segments := pathSegments(path)
-	parts := make([]string, 0, 4+len(segments))
+	version, rest := parseVersionFromPath(path)
+	segments := pathSegments(rest)
+	parts := make([]string, 0, 5+len(segments))
 	parts = append(parts, c.websiteName, "*")
+	if version > 0 {
+		parts = append(parts, fmt.Sprintf("v%d", version))
+	}
 	parts = append(parts, segments...)
 	parts = append(parts, "*", "message")
 	return strings.Join(parts, ".")
 }
 
 // clientMessageSubjectNoUID returns the NATS wildcard subject for
-// unauthenticated SSE page connections (uid absent).
+// unauthenticated SSE page connections (uid absent). When the path includes a
+// version prefix the version segment is injected after the website name.
 //
-// Format: {website}.{pathSegments}.*.message
+// No version:  {website}.{pathSegments}.*.message
+// Versioned:   {website}.v{N}.{pathSegments}.*.message
 func (c *Client) clientMessageSubjectNoUID(path string) string {
-	segments := pathSegments(path)
-	parts := make([]string, 0, 3+len(segments))
+	version, rest := parseVersionFromPath(path)
+	segments := pathSegments(rest)
+	parts := make([]string, 0, 4+len(segments))
 	parts = append(parts, c.websiteName)
+	if version > 0 {
+		parts = append(parts, fmt.Sprintf("v%d", version))
+	}
 	parts = append(parts, segments...)
 	parts = append(parts, "*", "message")
 	return strings.Join(parts, ".")
@@ -504,12 +533,7 @@ func (c *Client) clientMessageSubjectNoUID(path string) string {
 
 // ─── Conn — per-request / per-message connection handle ──────────────────────
 
-// Conn is passed to every Handler and SSEHandler invocation. It exposes
-// response and SSE push methods. All methods are safe to call from multiple
-// goroutines.
-//
-// For the new SSEHandler model, clientMsg is set and req is nil. For the
-// legacy Handle model, req is set and clientMsg is nil.
+// Conn is passed to every Handler and SSEHandler invocation.
 type Conn struct {
 	nc          *nats.Conn
 	js          nats.JetStreamContext
@@ -562,8 +586,7 @@ func (c *Conn) reqPath() string {
 }
 
 // Respond publishes a RelayResponse for a standard (non-SSE) endpoint via
-// core NATS. Response subjects are ephemeral per-request UUIDs that are not
-// covered by the JetStream stream, so core publish is correct here.
+// core NATS.
 func (c *Conn) Respond(status int, headers map[string][]string, body json.RawMessage) error {
 	if body == nil {
 		body = json.RawMessage("null")
@@ -588,8 +611,7 @@ func (c *Conn) RespondError(status int, errMsg string) error {
 	return c.publishResponse(resp)
 }
 
-// PatchElements pushes an HTML patch to the SSE connection associated with
-// this Conn via JetStream.
+// PatchElements pushes an HTML patch to the SSE connection via JetStream.
 func (c *Conn) PatchElements(html string) error {
 	return c.publishSSEEvent(sseEvent{
 		ConnUUID: c.connUUID(),
@@ -638,8 +660,6 @@ func (c *Conn) Redirect(url string) error {
 
 // ─── internal helpers ─────────────────────────────────────────────────────────
 
-// publishResponse publishes via core NATS. Response subjects are ephemeral
-// per-request UUIDs not covered by any JetStream stream.
 func (c *Conn) publishResponse(resp Response) error {
 	subject := responseSubject(c.websiteName, c.uid(), c.reqPath(), c.reqUUID())
 	payload, err := json.Marshal(resp)
@@ -649,24 +669,11 @@ func (c *Conn) publishResponse(resp Response) error {
 	return c.nc.Publish(subject, payload)
 }
 
-// publishSSEEvent publishes an SSE event via JetStream. The SSE event subject
-// ({website}.{uid}.sse.{conn_uuid}.event) is covered by the relay's JetStream
-// stream ("{website}.>"). The relay subscribes to it via a JetStream push
-// consumer, so this publish must go through JetStream to be delivered.
 func (c *Conn) publishSSEEvent(event sseEvent) error {
 	subject := sseEventSubject(c.websiteName, c.uid(), c.connUUID())
 	return c.jsPublish(subject, event)
 }
 
-// publishSSEEventTo publishes an SSE event to an explicit conn_uuid via
-// JetStream.
-func (c *Conn) publishSSEEventTo(uid, connUUID string, event sseEvent) error {
-	subject := sseEventSubject(c.websiteName, uid, connUUID)
-	return c.jsPublish(subject, event)
-}
-
-// jsPublish marshals v and publishes it to subject via JetStream, waiting for
-// server acknowledgment.
 func (c *Conn) jsPublish(subject string, v any) error {
 	payload, err := json.Marshal(v)
 	if err != nil {
