@@ -8,10 +8,8 @@ import (
 // TestClientMessageSubjectWithUID verifies the wildcard subject used by
 // HandleSSE for authenticated connections.
 //
-// Format: {website}.*.{pathSegments}.*.message
-//
-// /sse/dashboard → segments: sse, dashboard
-// Result: battlefrontier.*.sse.dashboard.*.message
+// Unversioned format: {website}.*.{pathSegments}.*.message
+// Versioned format:   {website}.*.v{N}.{pathSegments}.*.message
 func TestClientMessageSubjectWithUID(t *testing.T) {
 	c := &Client{websiteName: "battlefrontier"}
 
@@ -39,6 +37,19 @@ func TestClientMessageSubjectWithUID(t *testing.T) {
 			path: "/sse/v1.2/page",
 			want: "battlefrontier.*.sse.v1_2.page.*.message",
 		},
+		// Versioned paths — version segment injected after uid wildcard.
+		{
+			path: "/v0/sse/index",
+			want: "battlefrontier.*.v0.sse.index.*.message",
+		},
+		{
+			path: "/v1/sse/dashboard",
+			want: "battlefrontier.*.v1.sse.dashboard.*.message",
+		},
+		{
+			path: "/v2/sse/battle",
+			want: "battlefrontier.*.v2.sse.battle.*.message",
+		},
 	}
 
 	for _, tc := range cases {
@@ -52,10 +63,8 @@ func TestClientMessageSubjectWithUID(t *testing.T) {
 // TestClientMessageSubjectNoUID verifies the wildcard subject used by
 // HandleSSE for unauthenticated connections.
 //
-// Format: {website}.{pathSegments}.*.message
-//
-// /sse/dashboard → segments: sse, dashboard
-// Result: battlefrontier.sse.dashboard.*.message
+// Unversioned format: {website}.{pathSegments}.*.message
+// Versioned format:   {website}.v{N}.{pathSegments}.*.message
 func TestClientMessageSubjectNoUID(t *testing.T) {
 	c := &Client{websiteName: "battlefrontier"}
 
@@ -83,6 +92,19 @@ func TestClientMessageSubjectNoUID(t *testing.T) {
 			path: "/sse/v1.2/page",
 			want: "battlefrontier.sse.v1_2.page.*.message",
 		},
+		// Versioned paths — version segment injected after website name.
+		{
+			path: "/v0/sse/index",
+			want: "battlefrontier.v0.sse.index.*.message",
+		},
+		{
+			path: "/v1/sse/dashboard",
+			want: "battlefrontier.v1.sse.dashboard.*.message",
+		},
+		{
+			path: "/v2/sse/battle",
+			want: "battlefrontier.v2.sse.battle.*.message",
+		},
 	}
 
 	for _, tc := range cases {
@@ -95,9 +117,6 @@ func TestClientMessageSubjectNoUID(t *testing.T) {
 
 // TestClientMessageSubject_NoExtraSSEToken is a regression test confirming
 // that the old format with a redundant sse token is not produced.
-//
-// Old (wrong): battlefrontier.*.sse.dashboard.sse.*.message
-// New (correct): battlefrontier.*.sse.dashboard.*.message
 func TestClientMessageSubject_NoExtraSSEToken(t *testing.T) {
 	c := &Client{websiteName: "battlefrontier"}
 
@@ -131,9 +150,10 @@ func TestClientMessageSubject_NoExtraSSEToken_NoUID(t *testing.T) {
 }
 
 // TestRequestSubjectWithUID verifies the wildcard subject for authenticated
-// standard requests.
+// standard requests including versioned paths.
 //
-// Format: {website}.*.{pathSegments}.request.*
+// Unversioned: {website}.*.{pathSegments}.request.*
+// Versioned:   {website}.*.v{N}.{pathSegments}.request.*
 func TestRequestSubjectWithUID(t *testing.T) {
 	c := &Client{websiteName: "battlefrontier"}
 
@@ -153,6 +173,15 @@ func TestRequestSubjectWithUID(t *testing.T) {
 			path: "/api/v1.2/endpoint",
 			want: "battlefrontier.*.api.v1_2.endpoint.request.*",
 		},
+		// Versioned paths.
+		{
+			path: "/v0/api/login",
+			want: "battlefrontier.*.v0.api.login.request.*",
+		},
+		{
+			path: "/v1/api/logout",
+			want: "battlefrontier.*.v1.api.logout.request.*",
+		},
 	}
 
 	for _, tc := range cases {
@@ -164,9 +193,10 @@ func TestRequestSubjectWithUID(t *testing.T) {
 }
 
 // TestRequestSubjectNoUID verifies the wildcard subject for unauthenticated
-// standard requests.
+// standard requests including versioned paths.
 //
-// Format: {website}.{pathSegments}.request.*
+// Unversioned: {website}.{pathSegments}.request.*
+// Versioned:   {website}.v{N}.{pathSegments}.request.*
 func TestRequestSubjectNoUID(t *testing.T) {
 	c := &Client{websiteName: "battlefrontier"}
 
@@ -182,6 +212,15 @@ func TestRequestSubjectNoUID(t *testing.T) {
 			path: "/api/v2/profile/update",
 			want: "battlefrontier.api.v2.profile.update.request.*",
 		},
+		// Versioned paths.
+		{
+			path: "/v0/api/login",
+			want: "battlefrontier.v0.api.login.request.*",
+		},
+		{
+			path: "/v1/api/logout",
+			want: "battlefrontier.v1.api.logout.request.*",
+		},
 	}
 
 	for _, tc := range cases {
@@ -193,9 +232,6 @@ func TestRequestSubjectNoUID(t *testing.T) {
 }
 
 // TestResponseSubject verifies the response subject builder.
-//
-// Format (uid present): {website}.{uid}.{pathSegments}.response.{uuid}
-// Format (uid absent):  {website}.{pathSegments}.response.{uuid}
 func TestResponseSubject(t *testing.T) {
 	cases := []struct {
 		website string
@@ -237,9 +273,6 @@ func TestResponseSubject(t *testing.T) {
 }
 
 // TestSSEEventSubject verifies the event subject used by Conn SSE push methods.
-//
-// Format (uid present): {website}.{uid}.sse.{conn_uuid}.event
-// Format (uid absent):  {website}.sse.{conn_uuid}.event
 func TestSSEEventSubject(t *testing.T) {
 	cases := []struct {
 		website  string
@@ -272,9 +305,6 @@ func TestSSEEventSubject(t *testing.T) {
 
 // TestSSEDisconnectedSubject verifies the disconnected subject used by the
 // legacy Handle model.
-//
-// Format (uid present): {website}.{uid}.sse.{conn_uuid}.disconnected
-// Format (uid absent):  {website}.sse.{conn_uuid}.disconnected
 func TestSSEDisconnectedSubject(t *testing.T) {
 	cases := []struct {
 		website  string
@@ -305,8 +335,7 @@ func TestSSEDisconnectedSubject(t *testing.T) {
 	}
 }
 
-// TestPathSegments verifies the path segment splitter used by all subject
-// builders.
+// TestPathSegments verifies the path segment splitter.
 func TestPathSegments(t *testing.T) {
 	cases := []struct {
 		path string
@@ -333,6 +362,31 @@ func TestPathSegments(t *testing.T) {
 			if got[i] != tc.want[i] {
 				t.Errorf("pathSegments(%q)[%d]: got %q, want %q", tc.path, i, got[i], tc.want[i])
 			}
+		}
+	}
+}
+
+// TestParseVersionFromPath verifies version prefix extraction.
+func TestParseVersionFromPath(t *testing.T) {
+	cases := []struct {
+		path        string
+		wantVersion int
+		wantRest    string
+	}{
+		{"/v0/sse/index", 0, "/sse/index"},
+		{"/v1/api/login", 1, "/api/login"},
+		{"/v10/sse/dashboard", 10, "/sse/dashboard"},
+		{"/sse/dashboard", 0, "/sse/dashboard"},
+		{"/api/login", 0, "/api/login"},
+		{"/v0/", 0, "/"},
+		{"/v1", 1, "/"},
+	}
+
+	for _, tc := range cases {
+		gotV, gotR := parseVersionFromPath(tc.path)
+		if gotV != tc.wantVersion || gotR != tc.wantRest {
+			t.Errorf("parseVersionFromPath(%q)\n  got  version=%d rest=%q\n  want version=%d rest=%q",
+				tc.path, gotV, gotR, tc.wantVersion, tc.wantRest)
 		}
 	}
 }
@@ -383,29 +437,29 @@ func TestBaseSegments(t *testing.T) {
 
 // TestAllConfiguredEndpoints_ClientMessageSubjects verifies the wildcard
 // subjects the SDK would subscribe to for every SSE endpoint in
-// battlefrontier.json.
+// battlefrontier.json (all versioned with /v0/).
 func TestAllConfiguredEndpoints_ClientMessageSubjects(t *testing.T) {
 	c := &Client{websiteName: "battlefrontier"}
 
 	cases := []struct {
-		path          string
-		wantWithUID   string
+		path           string
+		wantWithUID    string
 		wantWithoutUID string
 	}{
 		{
-			path:           "/sse/login",
-			wantWithUID:    "battlefrontier.*.sse.login.*.message",
-			wantWithoutUID: "battlefrontier.sse.login.*.message",
+			path:           "/v0/sse/index",
+			wantWithUID:    "battlefrontier.*.v0.sse.index.*.message",
+			wantWithoutUID: "battlefrontier.v0.sse.index.*.message",
 		},
 		{
-			path:           "/sse/dashboard",
-			wantWithUID:    "battlefrontier.*.sse.dashboard.*.message",
-			wantWithoutUID: "battlefrontier.sse.dashboard.*.message",
+			path:           "/v0/sse/dashboard",
+			wantWithUID:    "battlefrontier.*.v0.sse.dashboard.*.message",
+			wantWithoutUID: "battlefrontier.v0.sse.dashboard.*.message",
 		},
 		{
-			path:           "/sse/public",
-			wantWithUID:    "battlefrontier.*.sse.public.*.message",
-			wantWithoutUID: "battlefrontier.sse.public.*.message",
+			path:           "/v0/sse/login",
+			wantWithUID:    "battlefrontier.*.v0.sse.login.*.message",
+			wantWithoutUID: "battlefrontier.v0.sse.login.*.message",
 		},
 	}
 
