@@ -106,6 +106,9 @@ const (
 	// ClientMessageConnected is published when the browser opens the SSE connection.
 	ClientMessageConnected ClientMessageType = "connected"
 
+	// ClientMessageReconnected is published when the browser reopens the SSE connection.
+	ClientMessageReconnected ClientMessageType = "reconnected"
+
 	// ClientMessageAction is published when the browser POSTs to /{path}/message.
 	ClientMessageAction ClientMessageType = "action"
 
