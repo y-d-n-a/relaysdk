@@ -1,4 +1,3 @@
-
 module github.com/y-d-n-a/relaysdk
 
 go 1.25.6
