@@ -15,13 +15,26 @@ import (
 
 // ─── Message types (mirror relay internal types) ──────────────────────────────
 
-// Request is received by the backend for standard endpoints.
+// Request is received by the backend for standard (non-SSE) endpoints.
+//
+// The relay publishes one Request per HTTP call on a standard endpoint after
+// all relay-level validation has passed (CORS, auth, endpoint registration,
+// method check). By the time your handler receives a Request, the relay has
+// already returned HTTP 200 to the browser. Your handler should push results
+// back to the browser over the open SSE connection using conn.PatchElements,
+// conn.PatchSignals, etc.
+//
+// ConnUUID is the conn_uuid of the open SSE connection that the browser has
+// established for the current page. The relay extracts it from the Datastar
+// signal store (the frontend automatically includes it in every request because
+// handleSSE patches it into the signal store when the SSE connection opens).
+// The backend uses ConnUUID to route SSE events back to the correct browser
+// connection via conn.PatchElements, conn.PatchSignals, etc.
 //
 // Signals contains the Datastar signal store values sent with the request.
-// For GET requests these come from the ?datastar= query parameter.
-// For POST/PUT/PATCH/DELETE these come from the JSON body.
-// The relay extracts them before publishing so the backend never needs an
-// *http.Request.
+// The relay uses datastar.ReadSignals to extract these regardless of HTTP
+// method — GET reads from the query string, all other methods read from the
+// body. The backend never needs an *http.Request.
 type Request struct {
 	UUID        string              `json:"uuid"`
 	ConnUUID    string              `json:"conn_uuid,omitempty"`
@@ -32,12 +45,13 @@ type Request struct {
 	Headers     map[string][]string `json:"headers"`
 	Body        json.RawMessage     `json:"body"`
 	QueryParams map[string][]string `json:"query_params"`
-	// Signals contains the Datastar signal store values extracted by the relay.
-	// Empty map when no signals were sent with the request.
-	Signals map[string]any `json:"signals,omitempty"`
+	Signals     map[string]any      `json:"signals,omitempty"`
 }
 
-// IsSSE returns true when this request opened an SSE connection.
+// IsSSE returns true when this request carries a ConnUUID, meaning it arrived
+// from a browser that has an open SSE connection. The relay rejects standard
+// endpoint requests that lack a connUUID before they reach your handler, so
+// this is always true for requests delivered via Handle.
 func (r *Request) IsSSE() bool {
 	return r.ConnUUID != ""
 }
@@ -83,41 +97,37 @@ func (r *Request) SignalBool(key string) bool {
 	return b
 }
 
-// Response is what the backend publishes for standard (non-SSE) endpoints.
-type Response struct {
-	UUID       string              `json:"uuid"`
-	StatusCode int                 `json:"status_code"`
-	Headers    map[string][]string `json:"headers"`
-	Body       json.RawMessage     `json:"body"`
-	Error      string              `json:"error,omitempty"`
-}
-
-// DisconnectNotification is received when an SSE client disconnects (legacy).
-type DisconnectNotification struct {
-	ConnUUID string `json:"conn_uuid"`
-	Website  string `json:"website"`
-	UID      string `json:"uid"`
-	Path     string `json:"path"`
-}
-
-// ─── ClientMessage (new model) ────────────────────────────────────────────────
+// ─── ClientMessage (SSE lifecycle model) ─────────────────────────────────────
 
 // ClientMessageType identifies the lifecycle stage of a ClientMessage.
 type ClientMessageType string
 
 const (
-	ClientMessageConnected    ClientMessageType = "connected"
-	ClientMessageAction       ClientMessageType = "action"
+	// ClientMessageConnected is published when the browser opens the SSE connection.
+	ClientMessageConnected ClientMessageType = "connected"
+
+	// ClientMessageAction is published when the browser POSTs to /{path}/message.
+	ClientMessageAction ClientMessageType = "action"
+
+	// ClientMessageDisconnected is published when the browser closes the SSE connection.
 	ClientMessageDisconnected ClientMessageType = "disconnected"
 )
 
 // ClientMessage is the single NATS message type for all SSE lifecycle events
-// and browser-initiated actions under the new per-page endpoint model.
+// and browser-initiated actions. The relay publishes one of these for every
+// SSE lifecycle event; the backend's HandleSSE handler receives all three types
+// on the same subscription.
 //
-// Signals contains the Datastar signal store values extracted by the relay:
-//   - ClientMessageConnected: signals from the initial SSE GET/POST request.
-//   - ClientMessageAction: signals from the companion POST body.
-//   - ClientMessageDisconnected: always empty (no request body on disconnect).
+// ConnUUID identifies the open SSE connection for its entire lifetime. The
+// backend uses it to route SSE events back to the browser via conn.PatchElements,
+// conn.PatchSignals, etc.
+//
+// Signals contains the Datastar signal store values sent with the request.
+// Populated for ClientMessageConnected (from the GET query string) and
+// ClientMessageAction (from the POST body). Empty for ClientMessageDisconnected.
+//
+// Payload carries the raw JSON body of the companion POST for
+// ClientMessageAction. Interpret it however your application requires.
 type ClientMessage struct {
 	ConnUUID    string              `json:"conn_uuid"`
 	MessageID   string              `json:"message_id"`
@@ -128,11 +138,8 @@ type ClientMessage struct {
 	Method      string              `json:"method,omitempty"`
 	Headers     map[string][]string `json:"headers,omitempty"`
 	QueryParams map[string][]string `json:"query_params,omitempty"`
-	Action      string              `json:"action,omitempty"`
 	Payload     json.RawMessage     `json:"payload,omitempty"`
-	// Signals contains the Datastar signal store values extracted by the relay.
-	// Empty map when no signals were sent.
-	Signals map[string]any `json:"signals,omitempty"`
+	Signals     map[string]any      `json:"signals,omitempty"`
 }
 
 // Signal returns the value of a single signal by key, or nil if not present.
@@ -189,7 +196,16 @@ const (
 	Redirect      SSEAction = "redirect"
 )
 
-// sseEvent is the internal payload published to the relay for SSE pushes.
+// sseEvent is the internal payload published to the relay's responses subject
+// to push a Datastar event down an open SSE connection.
+//
+// Published via JetStream to:
+//
+//	uid present: {website}.{path_segs}.{uid}.{conn_uuid}.responses
+//	uid absent:  {website}.{path_segs}.{conn_uuid}.responses
+//
+// The relay subscribes to this subject when the SSE connection opens and
+// dispatches each event to the browser using the appropriate Datastar method.
 type sseEvent struct {
 	ConnUUID string         `json:"conn_uuid"`
 	Action   SSEAction      `json:"action"`
@@ -203,20 +219,27 @@ type sseEvent struct {
 // ─── Handler types ────────────────────────────────────────────────────────────
 
 // Handler is called for every incoming standard request on a subscribed path.
+//
+// By the time this handler is called, the relay has already returned HTTP 200
+// to the browser. Push all results, errors, and state changes back to the
+// browser over the open SSE connection using conn.PatchElements,
+// conn.PatchSignals, etc.
 type Handler func(ctx context.Context, req *Request, conn *Conn)
 
-// DisconnectHandler is called when an SSE client disconnects (legacy Handle path).
-type DisconnectHandler func(note *DisconnectNotification)
-
-// SSEHandler is called for every ClientMessage received on a subscribed SSE path.
+// SSEHandler is called for every ClientMessage lifecycle event on a subscribed
+// SSE path. All three types (connected, action, disconnected) arrive on the
+// same subscription. The handler is called in a new goroutine for each message.
 type SSEHandler func(ctx context.Context, msg *ClientMessage, conn *Conn)
 
 // ─── WebsiteConfig mirrors config.WebsiteConfig for SDK use ──────────────────
 
 // WebsiteConfig is the configuration that a backend server publishes to the
-// NATS KV store so that relay servers can pick it up automatically.
+// NATS KV store bucket "relay-website-configs" so that relay servers can pick
+// it up automatically and begin routing HTTP traffic.
 //
-// Publish it on startup using client.PublishWebsiteConfig(cfg).
+// Call client.PublishWebsiteConfig(cfg) once on backend startup (and whenever
+// your endpoint config changes). The relay hot-reloads its routing whenever
+// a key is created or updated in the KV bucket.
 type WebsiteConfig struct {
 	WebsiteName           string           `json:"website_name"`
 	ApexDomain            string           `json:"apex_domain"`
@@ -226,17 +249,36 @@ type WebsiteConfig struct {
 
 // EndpointConfig describes a single relay endpoint for use in WebsiteConfig.
 type EndpointConfig struct {
-	Path                string   `json:"path"`
-	AllowedMethods      []string `json:"allowed_methods"`
-	RequireAuth         bool     `json:"require_auth"`
-	NatsSubjectOverride string   `json:"nats_subject_override"`
-	TimeoutSeconds      int      `json:"timeout_seconds"`
-	IsSSE               bool     `json:"is_sse"`
+	// Path is the HTTP path, e.g. "/v0/api/login" or "/sse/v0/dashboard".
+	Path string `json:"path"`
+
+	// AllowedMethods lists the HTTP methods this endpoint accepts.
+	// Empty means all methods are accepted.
+	AllowedMethods []string `json:"allowed_methods"`
+
+	// RequireAuth controls whether session authentication is enforced.
+	// When true, the relay verifies the session token and populates UID on
+	// all Request and ClientMessage values delivered to the backend.
+	RequireAuth bool `json:"require_auth"`
+
+	// NatsSubjectOverride bypasses the auto-generated subject base.
+	// Leave empty in almost all cases.
+	NatsSubjectOverride string `json:"nats_subject_override"`
+
+	// TimeoutSeconds controls the backend response timeout.
+	//  0  = use the server-level default (RequestTimeoutSeconds).
+	//  -1 = no timeout. Required for SSE endpoints.
+	//  >0 = override in seconds.
+	TimeoutSeconds int `json:"timeout_seconds"`
+
+	// IsSSE marks this endpoint as a long-lived Datastar SSE connection.
+	// Use HandleSSE for these endpoints. Use Handle for all others.
+	IsSSE bool `json:"is_sse"`
 }
 
 // ─── SDK Client ───────────────────────────────────────────────────────────────
 
-// Client is the SDK entry point. Create one per backend process.
+// Client is the SDK entry point. Create one per backend process with New.
 type Client struct {
 	nc          *nats.Conn
 	js          nats.JetStreamContext
@@ -245,17 +287,20 @@ type Client struct {
 	jsSubs      []*nats.Subscription
 }
 
-// Config holds the SDK configuration.
+// Config holds the SDK configuration passed to New.
 type Config struct {
 	// NatsURLs is the list of NATS server URLs to try in order.
+	// At least one is required.
 	NatsURLs []string
 
 	// WebsiteName must match the relay's website_name for this site.
+	// It is used as the first segment of every NATS subject.
 	WebsiteName string
 }
 
 // New connects to NATS, initialises a JetStream context, and returns a ready
-// Client.
+// Client. Tries each URL in NatsURLs in order and uses the first that succeeds.
+// Reconnects automatically on drop.
 func New(cfg Config) (*Client, error) {
 	if len(cfg.NatsURLs) == 0 {
 		return nil, fmt.Errorf("relaysdk: at least one NATS URL required")
@@ -309,11 +354,10 @@ func New(cfg Config) (*Client, error) {
 // PublishWebsiteConfig publishes the given WebsiteConfig to the NATS KV store
 // bucket "relay-website-configs" under the key cfg.WebsiteName.
 //
-// Call this on backend startup (and whenever the config changes) so that all
-// relay servers pick up the config automatically. The relay watches the KV
-// store and hot-reloads when a key is updated.
-//
-// The KV bucket is created automatically if it does not exist.
+// The relay watches this bucket and hot-reloads its endpoint routing whenever
+// a key is created or updated. Call this once on backend startup and whenever
+// your endpoint configuration changes. The KV bucket is created automatically
+// if it does not exist.
 func (c *Client) PublishWebsiteConfig(cfg WebsiteConfig) error {
 	if cfg.WebsiteName == "" {
 		return fmt.Errorf("relaysdk: PublishWebsiteConfig: WebsiteName is required")
@@ -324,7 +368,6 @@ func (c *Client) PublishWebsiteConfig(cfg WebsiteConfig) error {
 
 	const bucketName = "relay-website-configs"
 
-	// Ensure the bucket exists.
 	kv, err := c.js.KeyValue(bucketName)
 	if err == nats.ErrBucketNotFound {
 		kv, err = c.js.CreateKeyValue(&nats.KeyValueConfig{
@@ -350,11 +393,29 @@ func (c *Client) PublishWebsiteConfig(cfg WebsiteConfig) error {
 	return nil
 }
 
-// Handle subscribes to all requests arriving on the given HTTP path for
-// standard (non-SSE) endpoints.
-func (c *Client) Handle(path string, h Handler, onDisconnect DisconnectHandler) error {
-	authedSubject := c.requestSubjectWithUID(path)
-	anonSubject := c.requestSubjectNoUID(path)
+// Handle subscribes to all standard (non-SSE) HTTP requests arriving on the
+// given path. The handler is called in a new goroutine for every incoming
+// request.
+//
+// By the time your handler is called, the relay has already returned HTTP 200
+// to the browser. Push all results back to the browser over the open SSE
+// connection using conn.PatchElements, conn.PatchSignals, etc.
+//
+// Application-level errors (validation failures, not-found, permission denied,
+// etc.) should be communicated via conn.PatchSignals or conn.PatchElements,
+// not via HTTP status codes.
+//
+// The relay publishes standard requests to:
+//
+//	authenticated:   {website}.{path_segs}.{uid}.{conn_uuid}.{req_uuid}.request
+//	unauthenticated: {website}.{path_segs}.{conn_uuid}.{req_uuid}.request
+//
+// This method creates two JetStream subscriptions — one for each pattern —
+// so a single Handle call covers both authenticated and unauthenticated
+// requests for the same path.
+func (c *Client) Handle(path string, h Handler) error {
+	authedSubject := c.apiRequestSubjectWithUID(path)
+	anonSubject := c.apiRequestSubjectNoUID(path)
 
 	handler := func(msg *nats.Msg) {
 		if err := msg.Ack(); err != nil {
@@ -374,57 +435,7 @@ func (c *Client) Handle(path string, h Handler, onDisconnect DisconnectHandler) 
 			req:         &req,
 		}
 
-		ctx := context.Background()
-
-		if req.IsSSE() && onDisconnect != nil {
-			discSubject := sseDisconnectedSubject(c.websiteName, req.UID, req.ConnUUID)
-			discCtx, discCancel := context.WithCancel(ctx)
-			conn.discCancel = discCancel
-
-			discSub, err := c.nc.Subscribe(discSubject, func(dm *nats.Msg) {
-				var note DisconnectNotification
-				if err := json.Unmarshal(dm.Data, &note); err != nil {
-					log.Printf("relaysdk: malformed disconnect notification: %v", err)
-					return
-				}
-				discCancel()
-				onDisconnect(&note)
-			})
-			if err != nil {
-				log.Printf("relaysdk: failed to subscribe to disconnect subject %q: %v", discSubject, err)
-			} else {
-				conn.discSub = discSub
-				discSub.AutoUnsubscribe(1)
-			}
-			ctx = discCtx
-		} else if req.IsSSE() {
-			discSubject := sseDisconnectedSubject(c.websiteName, req.UID, req.ConnUUID)
-			discCtx, discCancel := context.WithCancel(ctx)
-			conn.discCancel = discCancel
-
-			discSub, err := c.nc.Subscribe(discSubject, func(dm *nats.Msg) {
-				discCancel()
-			})
-			if err != nil {
-				log.Printf("relaysdk: failed to subscribe to disconnect subject %q: %v", discSubject, err)
-			} else {
-				conn.discSub = discSub
-				discSub.AutoUnsubscribe(1)
-			}
-			ctx = discCtx
-		}
-
-		go func() {
-			defer func() {
-				if conn.discSub != nil {
-					conn.discSub.Unsubscribe()
-				}
-				if conn.discCancel != nil {
-					conn.discCancel()
-				}
-			}()
-			h(ctx, &req, conn)
-		}()
+		go h(context.Background(), &req, conn)
 	}
 
 	sub1, err := c.js.Subscribe(authedSubject, handler,
@@ -436,7 +447,7 @@ func (c *Client) Handle(path string, h Handler, onDisconnect DisconnectHandler) 
 		return fmt.Errorf("relaysdk: subscribe %q: %w", authedSubject, err)
 	}
 	c.jsSubs = append(c.jsSubs, sub1)
-	log.Printf("relaysdk: handling path %q → subject %q (JetStream)", path, authedSubject)
+	log.Printf("relaysdk: Handle path %q → subject %q (JetStream)", path, authedSubject)
 
 	sub2, err := c.js.Subscribe(anonSubject, handler,
 		nats.DeliverAll(),
@@ -447,16 +458,31 @@ func (c *Client) Handle(path string, h Handler, onDisconnect DisconnectHandler) 
 		return fmt.Errorf("relaysdk: subscribe %q: %w", anonSubject, err)
 	}
 	c.jsSubs = append(c.jsSubs, sub2)
-	log.Printf("relaysdk: handling path %q → subject %q (JetStream)", path, anonSubject)
+	log.Printf("relaysdk: Handle path %q → subject %q (JetStream)", path, anonSubject)
 
 	return nil
 }
 
-// HandleSSE subscribes to all ClientMessage events for the given SSE path via
-// JetStream.
+// HandleSSE subscribes to all ClientMessage lifecycle events for the given SSE
+// endpoint path. The handler is called for connected, action, and disconnected
+// messages — all three arrive on the same subscription.
+//
+// The relay publishes SSE lifecycle events to:
+//
+//	authenticated:   {website}.{path_segs}.{uid}.{conn_uuid}.request
+//	unauthenticated: {website}.{path_segs}.{conn_uuid}.request
+//
+// This method creates two JetStream subscriptions — one for each pattern —
+// so a single HandleSSE call covers both authenticated and unauthenticated
+// connections for the same path.
+//
+// Context cancellation: the context passed to the ClientMessageConnected
+// handler invocation is cancelled automatically when the corresponding
+// ClientMessageDisconnected message arrives for the same conn_uuid. Use
+// <-ctx.Done() to block until the user leaves.
 func (c *Client) HandleSSE(path string, h SSEHandler) error {
-	authedSubject := c.clientMessageSubjectWithUID(path)
-	anonSubject := c.clientMessageSubjectNoUID(path)
+	authedSubject := c.sseLifecycleSubjectWithUID(path)
+	anonSubject := c.sseLifecycleSubjectNoUID(path)
 
 	var (
 		cancelMu  sync.Mutex
@@ -543,7 +569,9 @@ func (c *Client) HandleSSE(path string, h SSEHandler) error {
 	return nil
 }
 
-// Close drains all subscriptions and closes the NATS connection.
+// Close drains all active NATS subscriptions and closes the NATS connection.
+// Call this on graceful shutdown to ensure all in-flight messages are processed
+// before the process exits.
 func (c *Client) Close() {
 	for _, s := range c.jsSubs {
 		s.Drain()
@@ -555,54 +583,107 @@ func (c *Client) Close() {
 }
 
 // ─── Subject builders (client-level) ─────────────────────────────────────────
+//
+// These methods build the JetStream wildcard subjects that the SDK subscribes
+// to. They mirror the relay's subject.go exactly so that relay publishes are
+// always matched by SDK subscriptions.
+//
+// ── Standard API endpoints ────────────────────────────────────────────────────
+//
+// The relay (BuildAPIRequestSubject) publishes standard requests to:
+//
+//	uid present: {website}.{path_segs}.{uid}.{conn_uuid}.{req_uuid}.request
+//	uid absent:  {website}.{path_segs}.{conn_uuid}.{req_uuid}.request
+//
+// SDK wildcard subscriptions:
+//
+//	uid present: {website}.{path_segs}.*.*.*.request  (uid + conn_uuid + req_uuid)
+//	uid absent:  {website}.{path_segs}.*.*.request    (conn_uuid + req_uuid)
+//
+// ── SSE lifecycle endpoints ───────────────────────────────────────────────────
+//
+// The relay (BuildRequestSubject) publishes SSE lifecycle events to:
+//
+//	uid present: {website}.{path_segs}.{uid}.{conn_uuid}.request
+//	uid absent:  {website}.{path_segs}.{conn_uuid}.request
+//
+// SDK wildcard subscriptions:
+//
+//	uid present: {website}.{path_segs}.*.*.request  (uid + conn_uuid)
+//	uid absent:  {website}.{path_segs}.*.request    (conn_uuid)
 
-func (c *Client) requestSubjectWithUID(path string) string {
+// apiRequestSubjectWithUID returns the JetStream wildcard subject for standard
+// endpoint requests where a uid is present.
+//
+// Format: {website}.{path_segs}.*.*.*.request
+// Wildcards match: uid, conn_uuid, req_uuid
+func (c *Client) apiRequestSubjectWithUID(path string) string {
 	segs := pathSegments(path)
-	parts := make([]string, 0, 4+len(segs))
-	parts = append(parts, c.websiteName, "*")
-	parts = append(parts, segs...)
-	parts = append(parts, "request", "*")
-	return strings.Join(parts, ".")
-}
-
-func (c *Client) requestSubjectNoUID(path string) string {
-	segs := pathSegments(path)
-	parts := make([]string, 0, 3+len(segs))
+	parts := make([]string, 0, 1+len(segs)+4)
 	parts = append(parts, c.websiteName)
 	parts = append(parts, segs...)
-	parts = append(parts, "request", "*")
+	parts = append(parts, "*", "*", "*", "request")
 	return strings.Join(parts, ".")
 }
 
-func (c *Client) clientMessageSubjectWithUID(path string) string {
+// apiRequestSubjectNoUID returns the JetStream wildcard subject for standard
+// endpoint requests where no uid is present (unauthenticated endpoints).
+//
+// Format: {website}.{path_segs}.*.*.request
+// Wildcards match: conn_uuid, req_uuid
+func (c *Client) apiRequestSubjectNoUID(path string) string {
 	segs := pathSegments(path)
-	parts := make([]string, 0, 4+len(segs))
-	parts = append(parts, c.websiteName, "*")
-	parts = append(parts, segs...)
-	parts = append(parts, "*", "message")
-	return strings.Join(parts, ".")
-}
-
-func (c *Client) clientMessageSubjectNoUID(path string) string {
-	segs := pathSegments(path)
-	parts := make([]string, 0, 3+len(segs))
+	parts := make([]string, 0, 1+len(segs)+3)
 	parts = append(parts, c.websiteName)
 	parts = append(parts, segs...)
-	parts = append(parts, "*", "message")
+	parts = append(parts, "*", "*", "request")
+	return strings.Join(parts, ".")
+}
+
+// sseLifecycleSubjectWithUID returns the JetStream wildcard subject for SSE
+// lifecycle events where a uid is present.
+//
+// Format: {website}.{path_segs}.*.*.request
+// Wildcards match: uid, conn_uuid
+func (c *Client) sseLifecycleSubjectWithUID(path string) string {
+	segs := pathSegments(path)
+	parts := make([]string, 0, 1+len(segs)+3)
+	parts = append(parts, c.websiteName)
+	parts = append(parts, segs...)
+	parts = append(parts, "*", "*", "request")
+	return strings.Join(parts, ".")
+}
+
+// sseLifecycleSubjectNoUID returns the JetStream wildcard subject for SSE
+// lifecycle events where no uid is present (unauthenticated SSE endpoints).
+//
+// Format: {website}.{path_segs}.*.request
+// Wildcard matches: conn_uuid
+func (c *Client) sseLifecycleSubjectNoUID(path string) string {
+	segs := pathSegments(path)
+	parts := make([]string, 0, 1+len(segs)+2)
+	parts = append(parts, c.websiteName)
+	parts = append(parts, segs...)
+	parts = append(parts, "*", "request")
 	return strings.Join(parts, ".")
 }
 
 // ─── Conn ─────────────────────────────────────────────────────────────────────
 
-// Conn is passed to every Handler and SSEHandler invocation.
+// Conn is passed to every Handler and SSEHandler invocation. It is the handle
+// through which your backend pushes data back to the browser over the open SSE
+// connection.
+//
+// All Conn methods publish Datastar SSE events to the relay, which immediately
+// writes them as SSE frames to the open browser connection. There is no
+// mechanism for the backend to send a direct HTTP response — the relay handles
+// all HTTP responses itself.
 type Conn struct {
 	nc          *nats.Conn
 	js          nats.JetStreamContext
 	websiteName string
 	req         *Request
 	clientMsg   *ClientMessage
-	discSub     *nats.Subscription
-	discCancel  context.CancelFunc
 }
 
 func (c *Conn) connUUID() string {
@@ -625,13 +706,6 @@ func (c *Conn) uid() string {
 	return ""
 }
 
-func (c *Conn) reqUUID() string {
-	if c.req != nil {
-		return c.req.UUID
-	}
-	return ""
-}
-
 func (c *Conn) reqPath() string {
 	if c.clientMsg != nil {
 		return c.clientMsg.Path
@@ -642,51 +716,35 @@ func (c *Conn) reqPath() string {
 	return ""
 }
 
-// Respond publishes a RelayResponse for a standard (non-SSE) endpoint.
-func (c *Conn) Respond(status int, headers map[string][]string, body json.RawMessage) error {
-	if body == nil {
-		body = json.RawMessage("null")
-	}
-	resp := Response{
-		UUID:       c.reqUUID(),
-		StatusCode: status,
-		Headers:    headers,
-		Body:       body,
-	}
-	return c.publishResponse(resp)
-}
+// ─── SSE push methods ─────────────────────────────────────────────────────────
 
-// RespondError publishes an error response for a standard endpoint.
-func (c *Conn) RespondError(status int, errMsg string) error {
-	resp := Response{
-		UUID:       c.reqUUID(),
-		StatusCode: status,
-		Error:      errMsg,
-	}
-	return c.publishResponse(resp)
-}
-
-// PatchElements pushes an HTML patch to the SSE connection.
+// PatchElements pushes an HTML fragment to the browser using Datastar's
+// morphing algorithm. The html string must contain elements with id attributes.
+// Datastar matches them against existing DOM elements and updates only what
+// changed.
 func (c *Conn) PatchElements(html string) error {
 	return c.publishSSEEvent(sseEvent{ConnUUID: c.connUUID(), Action: PatchElements, HTML: html})
 }
 
-// RemoveElement removes a DOM element by CSS selector on the SSE client.
+// RemoveElement removes the DOM element matching the CSS selector from the
+// browser page.
 func (c *Conn) RemoveElement(selector string) error {
 	return c.publishSSEEvent(sseEvent{ConnUUID: c.connUUID(), Action: RemoveElement, Selector: selector})
 }
 
-// PatchSignals merges signals into the Datastar store on the SSE client.
+// PatchSignals merges key-value pairs into the Datastar signal store on the
+// browser. The browser's reactive system automatically updates any DOM elements
+// bound to these signals.
 func (c *Conn) PatchSignals(signals map[string]any) error {
 	return c.publishSSEEvent(sseEvent{ConnUUID: c.connUUID(), Action: PatchSignals, Signals: signals})
 }
 
-// ExecuteScript runs a script on the SSE client.
+// ExecuteScript runs a JavaScript snippet in the browser.
 func (c *Conn) ExecuteScript(script string) error {
 	return c.publishSSEEvent(sseEvent{ConnUUID: c.connUUID(), Action: ExecuteScript, Script: script})
 }
 
-// Redirect navigates the SSE client to a new URL.
+// Redirect navigates the browser to url via a Datastar redirect event.
 func (c *Conn) Redirect(url string) error {
 	return c.publishSSEEvent(sseEvent{ConnUUID: c.connUUID(), Action: Redirect, URL: url})
 }
@@ -694,7 +752,7 @@ func (c *Conn) Redirect(url string) error {
 // ─── "To" variants — push to an explicit connection ──────────────────────────
 
 // PatchElementsTo pushes an HTML patch to a specific SSE connection identified
-// by uid and connUUID. Use this to push to another user's open connection.
+// by uid and connUUID.
 func (c *Conn) PatchElementsTo(uid, connUUID, html string) error {
 	return c.publishSSEEventTo(uid, connUUID, sseEvent{ConnUUID: connUUID, Action: PatchElements, HTML: html})
 }
@@ -704,7 +762,8 @@ func (c *Conn) RemoveElementTo(uid, connUUID, selector string) error {
 	return c.publishSSEEventTo(uid, connUUID, sseEvent{ConnUUID: connUUID, Action: RemoveElement, Selector: selector})
 }
 
-// PatchSignalsTo merges signals on a specific SSE connection.
+// PatchSignalsTo merges signals into the Datastar store on a specific SSE
+// connection.
 func (c *Conn) PatchSignalsTo(uid, connUUID string, signals map[string]any) error {
 	return c.publishSSEEventTo(uid, connUUID, sseEvent{ConnUUID: connUUID, Action: PatchSignals, Signals: signals})
 }
@@ -719,24 +778,20 @@ func (c *Conn) RedirectTo(uid, connUUID, url string) error {
 	return c.publishSSEEventTo(uid, connUUID, sseEvent{ConnUUID: connUUID, Action: Redirect, URL: url})
 }
 
-// ─── internal helpers ─────────────────────────────────────────────────────────
+// ─── internal publish helpers ─────────────────────────────────────────────────
 
-func (c *Conn) publishResponse(resp Response) error {
-	subject := responseSubject(c.websiteName, c.uid(), c.reqPath(), c.reqUUID())
-	payload, err := json.Marshal(resp)
-	if err != nil {
-		return fmt.Errorf("relaysdk: marshal response: %w", err)
-	}
-	return c.nc.Publish(subject, payload)
-}
-
+// publishSSEEvent publishes a Datastar SSE event via JetStream to the
+// responses subject for the current connection.
 func (c *Conn) publishSSEEvent(event sseEvent) error {
-	subject := sseEventSubject(c.websiteName, c.uid(), c.connUUID())
+	subject := sseResponsesSubject(c.websiteName, c.uid(), c.reqPath(), c.connUUID())
 	return c.jsPublish(subject, event)
 }
 
+// publishSSEEventTo publishes a Datastar SSE event to a specific connection
+// identified by uid and connUUID, using the current request's path to build
+// the subject.
 func (c *Conn) publishSSEEventTo(uid, connUUID string, event sseEvent) error {
-	subject := sseEventSubject(c.websiteName, uid, connUUID)
+	subject := sseResponsesSubject(c.websiteName, uid, c.reqPath(), connUUID)
 	return c.jsPublish(subject, event)
 }
 
@@ -751,42 +806,51 @@ func (c *Conn) jsPublish(subject string, v any) error {
 	return nil
 }
 
-// ─── Subject builders ─────────────────────────────────────────────────────────
+// ─── Subject builders (package-level, used by Conn) ──────────────────────────
 
-func responseSubject(website, uid, path, uuid string) string {
-	segs := baseSegments(website, uid, path)
-	segs = append(segs, "response", uuid)
+// sseResponsesSubject builds the JetStream subject the backend publishes SSE
+// events to. Mirrors relay/subject.go BuildSSEResponsesSubject.
+//
+// The relay subscribes to this exact subject (no wildcard) when the SSE
+// connection opens and dispatches each event to the browser.
+//
+// Format (uid present): {website}.{path_segs}.{uid}.{conn_uuid}.responses
+// Format (uid absent):  {website}.{path_segs}.{conn_uuid}.responses
+func sseResponsesSubject(website, uid, path, connUUID string) string {
+	segs := apiSegments(website, uid, path)
+	segs = append(segs, connUUID, "responses")
 	return strings.Join(segs, ".")
 }
 
-func sseEventSubject(website, uid, connUUID string) string {
-	return strings.Join(sseSegments(website, uid, connUUID, "event"), ".")
-}
+// ─── Internal segment helpers ─────────────────────────────────────────────────
 
-func sseDisconnectedSubject(website, uid, connUUID string) string {
-	return strings.Join(sseSegments(website, uid, connUUID, "disconnected"), ".")
-}
-
-func sseSegments(website, uid, connUUID, suffix string) []string {
-	if uid == "" {
-		return []string{website, "sse", connUUID, suffix}
-	}
-	return []string{website, uid, "sse", connUUID, suffix}
-}
-
-func baseSegments(website, uid, path string) []string {
+// apiSegments builds the website + path-segments + uid portion shared by all
+// subject builders. Mirrors relay/subject.go apiSegments exactly.
+//
+// uid comes AFTER the path segments:
+//
+//	uid non-empty: [website, seg1, seg2, …, uid]
+//	uid empty:     [website, seg1, seg2, …]
+func apiSegments(website, uid, path string) []string {
 	segs := pathSegments(path)
-	var out []string
-	if uid == "" {
-		out = make([]string, 0, 1+len(segs))
-		out = append(out, website)
-	} else {
-		out = make([]string, 0, 2+len(segs))
-		out = append(out, website, uid)
+	parts := make([]string, 0, 1+len(segs)+1)
+	parts = append(parts, website)
+	parts = append(parts, segs...)
+	if uid != "" {
+		parts = append(parts, uid)
 	}
-	return append(out, segs...)
+	return parts
 }
 
+// baseSegments is an alias for apiSegments, kept for test compatibility.
+func baseSegments(website, uid, path string) []string {
+	return apiSegments(website, uid, path)
+}
+
+// pathSegments splits a URL path into dot-safe NATS subject segments.
+// Empty segments (from leading/trailing slashes) are dropped.
+// Dots within a segment are replaced with underscores to avoid breaking
+// NATS subject parsing.
 func pathSegments(path string) []string {
 	parts := strings.Split(path, "/")
 	out := make([]string, 0, len(parts))
